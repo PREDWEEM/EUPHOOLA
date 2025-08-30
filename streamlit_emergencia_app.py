@@ -5,9 +5,74 @@ from pathlib import Path
 import plotly.graph_objects as go
 import xml.etree.ElementTree as ET
 from urllib.request import urlopen, Request
+import time
 
 # ================== Config de página (PRIMER st.*) ==================
 st.set_page_config(page_title="Predicción de Emergencia Agrícola EUPHO - OLAVARRIA 2025", layout="wide")
+
+# ================== UX y estabilidad: embed, refresco, reintentos ==================
+def _get_query_params():
+    try:
+        qp = st.query_params
+        if isinstance(qp, dict):
+            return {k: [v] if isinstance(v, str) else v for k, v in qp.items()}
+        return dict(qp)
+    except Exception:
+        try:
+            return st.experimental_get_query_params()
+        except Exception:
+            return {}
+
+def is_embedded() -> bool:
+    qp = _get_query_params()
+    val = str(qp.get("embed", [""])[0]).lower()
+    return val in {"1", "true", "yes"}
+
+def setup_embed_tools(base_url: str | None = None):
+    if is_embedded():
+        st.info("App embebida: si no arranca, abrila completa o reintentá la carga.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if base_url:
+                st.link_button("🔗 Abrir app completa", base_url)
+        with c2:
+            if st.button("🔁 Reintentar (limpiar caché y recargar)"):
+                try:
+                    st.cache_data.clear()
+                    st.cache_resource.clear()
+                except Exception:
+                    pass
+                st.rerun()
+
+def clear_and_rerun():
+    try:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+    except Exception:
+        pass
+    st.rerun()
+
+def sidebar_refresh_button(label: str = "🔄 Refrescar datos"):
+    with st.sidebar:
+        if st.button(label):
+            clear_and_rerun()
+
+def with_retries(fn, retries: int = 2, delay: float = 0.8):
+    def _wrapped(*args, **kwargs):
+        last_err = None
+        for i in range(retries + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                if i < retries:
+                    time.sleep(delay)
+        raise last_err
+    return _wrapped
+
+# Si conocés la URL pública directa de esta app, ponela acá para el botón "Abrir app completa":
+setup_embed_tools(base_url=None)
+sidebar_refresh_button()
 
 # ================== Configuración visual y constantes ==================
 THR_BAJO_MEDIO = 0.02
@@ -23,23 +88,16 @@ API_URL = "https://meteobahia.com.ar/scripts/forecast/for-ol.xml"
 PRON_DIAS_API = 8  # usar solo los primeros 8 días (API y Excel)
 
 # ================== Horizonte móvil acotado ==================
-
-# Ventana permitida para análisis (fijo)
 VENTANA_MIN = pd.Timestamp("2025-09-01")
 VENTANA_MAX = pd.Timestamp("2026-01-01")  # inclusive
 
-# Fecha actual
 HOY = pd.Timestamp.now().normalize()
-
-# Horizonte móvil: hoy → hoy + 7 días (8 días en total)
 rango_movil_inicio = HOY
 rango_movil_fin = HOY + pd.Timedelta(days=7)
 
-# Acotar a la ventana permitida
 fecha_inicio = max(rango_movil_inicio, VENTANA_MIN)
 fecha_fin    = min(rango_movil_fin,    VENTANA_MAX)
 
-# Mostrar al usuario
 st.caption(f"Horizonte de análisis: {fecha_inicio.date()} → {fecha_fin.date()} (máx. 8 días dentro de la ventana permitida)")
 
 # ================== Modelo ANN (pesos embebidos) ==================
@@ -68,22 +126,17 @@ class PracticalANNModel:
         self.input_min = np.array([1.0, 7.7, -3.5, 0.0], dtype=float)
         self.input_max = np.array([148.0, 38.5, 23.5, 59.9], dtype=float)
 
-    def tansig(self, x):
-        return np.tanh(x)
-
+    def tansig(self, x): return np.tanh(x)
     def normalize_input(self, X_real):
         Xc = np.clip(X_real, self.input_min, self.input_max)
         return 2 * (Xc - self.input_min) / (self.input_max - self.input_min) - 1
-
     def desnormalize_output(self, y_norm, ymin=-1.0, ymax=1.0):
         return (y_norm - ymin) / (ymax - ymin)
-
     def _predict_single(self, x_norm):
         z1 = self.IW.T @ x_norm + self.bias_IW
         a1 = self.tansig(z1)
         z2 = self.LW @ a1 + self.bias_out
         return self.tansig(z2)
-
     def predict(self, X_real):
         X_norm = self.normalize_input(X_real.astype(float))
         emerrel_pred = np.array([self._predict_single(x) for x in X_norm], dtype=float)
@@ -92,17 +145,17 @@ class PracticalANNModel:
         valor_max_emeac = 8.05
         emer_ac = emerrel_cumsum / valor_max_emeac
         emerrel_diff = np.diff(emer_ac, prepend=0.0)
-
         def clasificar(v):
-            if v < THR_BAJO_MEDIO:
-                return "Bajo"
-            elif v <= THR_MEDIO_ALTO:
-                return "Medio"
-            else:
-                return "Alto"
-
+            if v < THR_BAJO_MEDIO: return "Bajo"
+            elif v <= THR_MEDIO_ALTO: return "Medio"
+            else: return "Alto"
         riesgo = np.array([clasificar(v) for v in emerrel_diff], dtype=object)
         return pd.DataFrame({"EMERREL(0-1)": emerrel_diff, "Nivel_Emergencia_relativa": riesgo})
+
+@st.cache_resource
+def get_model():
+    return PracticalANNModel()
+modelo = get_model()
 
 # ================== Helpers API MeteoBahia ==================
 @st.cache_data(ttl=15*60, show_spinner=False)
@@ -110,6 +163,10 @@ def _fetch_xml(url: str) -> bytes:
     req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Streamlit MeteoBahia)"})
     with urlopen(req, timeout=20) as r:
         return r.read()
+
+def fetch_xml_with_feedback(url: str) -> bytes:
+    with st.spinner("Conectando a MeteoBahia..."):
+        return with_retries(_fetch_xml, retries=2, delay=0.8)(url)
 
 @st.cache_data(ttl=15*60, show_spinner=False)
 def parse_meteobahia_xml(xml_bytes: bytes) -> pd.DataFrame:
@@ -158,16 +215,6 @@ if fuente == "Subir Excel (.xlsx)":
         accept_multiple_files=True
     )
 
-@st.cache_resource
-def get_model():
-    return PracticalANNModel()
-modelo = get_model()
-
-def _clasificar_local(v: float) -> str:
-    if v < THR_BAJO_MEDIO: return "Bajo"
-    elif v <= THR_MEDIO_ALTO: return "Medio"
-    else: return "Alto"
-
 def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
     req = {"Julian_days","TMAX","TMIN","Prec"}
     if not req.issubset(df.columns):
@@ -190,8 +237,7 @@ def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
     if df_win.empty:
         st.warning(f"{nombre}: no hay datos en {fecha_inicio.date()} → {fecha_fin.date()}")
         return
-    if len(df_win) < PRON_DIAS_API:
-        st.info(f"{nombre}: solo {len(df_win)} día(s) disponibles en esa ventana")
+    # 🚫 Eliminado el mensaje “solo X día(s)...”
 
     X_real = df_win[["Julian_days","TMAX","TMIN","Prec"]].to_numpy(float)
     fechas = df_win["Fecha"]
@@ -265,18 +311,20 @@ if fuente == "Subir Excel (.xlsx)":
     else:
         st.info("Sube al menos un archivo .xlsx para iniciar el análisis.")
 else:
-    # 1) Traer y parsear API (manejo de errores SOLO acá)
     try:
-        xml_bytes = _fetch_xml(API_URL)
+        xml_bytes = fetch_xml_with_feedback(API_URL)  # ✅ spinner + reintentos
         df_api = parse_meteobahia_xml(xml_bytes)
     except Exception as e:
         st.error(f"No se pudo leer la API MeteoBahia: {e}")
     else:
-        # 2) Recortar y mostrar resultados (errores de gráficos NO se confunden con la API)
-        df_api = (df_api.sort_values("Fecha")
-                        .drop_duplicates("Fecha")
-                        .head(PRON_DIAS_API)
-                        .reset_index(drop=True))
-        st.success(f"API MeteoBahia: {df_api['Fecha'].min().date()} → {df_api['Fecha'].max().date()} · {len(df_api)} días (recortado a {PRON_DIAS_API})")
-        procesar_y_mostrar(df_api, "MeteoBahia_API")
+        if df_api.empty:
+            st.error("La API no devolvió datos utilizables en la ventana seleccionada.")
+        else:
+            df_api = (df_api.sort_values("Fecha")
+                              .drop_duplicates("Fecha")
+                              .head(PRON_DIAS_API)
+                              .reset_index(drop=True))
+            st.success(f"API MeteoBahia: {df_api['Fecha'].min().date()} → {df_api['Fecha'].max().date()} · {len(df_api)} días (recortado a {PRON_DIAS_API})")
+            procesar_y_mostrar(df_api, "MeteoBahia_API")
+
 
