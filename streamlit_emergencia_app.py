@@ -30,7 +30,7 @@ def is_embedded() -> bool:
 
 def app_base_url() -> str:
     # URL directa de tu app (sin parámetros)
-    return "https://appemergenciapy-lscuxqt2j3sa9yjrwgyqnh.streamlit.app/"
+    return "https://appemergenciaapppy-ks3ttrlqmmsemkfhzx3w8e.streamlit.app/"
 
 if is_embedded():
     st.info("Esta app está embebida. Si no arranca o quedó dormida, ábrela en una pestaña nueva o reintenta la carga.")
