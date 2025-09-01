@@ -9,7 +9,7 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
 # ================== Config ==================
-API_URL = os.getenv("METEOBAHIA_URL", "https://meteobahia.com.ar/scripts/forecast/for-bb.xml")
+API_URL = os.getenv("METEOBAHIA_URL", "https://meteobahia.com.ar/scripts/forecast/for-ol.xml")
 PRON_DIAS_API = int(os.getenv("PRON_DIAS_API", "8"))  # hoy + 7
 CSV_PATH = "data/meteo_daily.csv"
 TZ = pytz.timezone("America/Argentina/Buenos_Aires")
