@@ -27,7 +27,7 @@ jobs:
 
       - name: Update CSV from API
         env:
-          METEOBAHIA_URL: https://meteobahia.com.ar/scripts/forecast/for-bb.xml  # <--- AJUSTAR localidad
+          METEOBAHIA_URL: https://meteobahia.com.ar/scripts/forecast/for-ol.xml  # <--- AJUSTAR localidad
           PRON_DIAS_API: 8
         run: |
           python update_meteo.py
