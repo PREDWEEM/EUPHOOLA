@@ -60,7 +60,7 @@ EMEAC_MIN_DEN = 5.0   # Banda inferior
 EMEAC_MAX_DEN = 15.0  # Banda superior
 
 # API Bahía Blanca
-API_URL = "https://meteobahia.com.ar/scripts/forecast/for-bb.xml"
+API_URL = "https://meteobahia.com.ar/scripts/forecast/for-ol.xml"
 
 # Ventana conceptual (para recorte y para los ejes de los gráficos)
 VENTANA_MIN = pd.Timestamp("2025-09-01")
