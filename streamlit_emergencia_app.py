@@ -1,42 +1,28 @@
 # -*- coding: utf-8 -*-
-# streamlit_emergencia_app_persistente_csv_only.py
-# EUPHO – Serie persistente (solo lee meteo_history.csv), SIN reindex (no inventa fechas),
-# ventana de gráficos fija: 2025-09-01 → 2026-01-01
-# EMERREL: eje Y fijo 0–0.08 · EMEAC: eje Y fijo 0–100%
+# app_history_horizon_only.py
+# Lee SOLO meteo_history.csv y ejecuta la red neuronal sobre ese horizonte.
+# No consulta APIs, no reindexa, no "inventa" días. Todo sale del CSV.
+# Acepta dos esquemas de columnas:
+#   A) date, tmax, tmin, prec [, jd, source, updated_at]
+#   B) Fecha, Julian_days, TMAX, TMIN, Prec
+#
+# Gráficos: EMERREL diario (barras + MA5 + relleno tricolor interno),
+# EMEAC (%) (curva con banda mín/máx) y tabla con emojis de nivel final.
 
 from pathlib import Path
-
 import streamlit as st
-import numpy as np
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 
-# ================== Config de página ==================
-st.set_page_config(page_title="Predicción de Emergencia Agrícola EUPHO – OLAVARRIA", layout="wide")
+st.set_page_config(page_title="PREDWEEM · Solo con meteo_history.csv", layout="wide")
 
-# ================== Constantes visuales y modelo ==================
-THR_BAJO_MEDIO = 0.02
-THR_MEDIO_ALTO = 0.079
-COLOR_MAP = {"Bajo": "#2ca02c", "Medio": "#ff7f0e", "Alto": "#d62728"}
-COLOR_FALLBACK = "#808080"
+CSV_PATH = Path("meteo_history.csv")
 
-EMEAC_MIN_DEN = 5.0   # Banda inferior
-EMEAC_MAX_DEN = 15.0  # Banda superior
-
-# Ventana conceptual (para recorte y para los ejes de los gráficos)
-VENTANA_MIN = pd.Timestamp("2025-09-01")
-VENTANA_MAX = pd.Timestamp("2026-01-01")
-START_SERIE = VENTANA_MIN
-END_SERIE   = VENTANA_MAX
-st.caption(f"Ventana fija en gráficos: {START_SERIE.date()} → {END_SERIE.date()} (se dibujan solo fechas con datos reales)")
-
-# Archivo local para lectura (única fuente)
-HISTORY_PATH = Path("meteo_history.csv")
-
-# ================== Modelo ANN ==================
+# ======== Red neuronal (estructura compacta y determinística) ========
 class PracticalANNModel:
     def __init__(self):
-        # Pesos/normalización (ajustar si corresponde a tu último entrenamiento)
+        import numpy as np
         self.IW = np.array([
             [-2.924160, -7.896739, -0.977000, 0.554961, 9.510761, 8.739410, 10.592497, 21.705275, -2.532038, 7.847811,
              -3.907758, 13.933289, 3.727601, 3.751941, 0.639185, -0.758034, 1.556183, 10.458917, -1.343551, -14.721089],
@@ -57,308 +43,267 @@ class PracticalANNModel:
             2.703778, 4.776029
         ], dtype=float)
         self.bias_out = -5.394722
-
-        # Orden esperado y normalización (Julian_days, TMAX, TMIN, Prec)
+        # Rango de normalización de entrada [min, max] para [JD, TMAX, TMIN, Prec]
         self.input_min = np.array([1.0, 7.7, -3.5, 0.0], dtype=float)
         self.input_max = np.array([148.0, 38.5, 23.5, 59.9], dtype=float)
 
-    def tansig(self, x): return np.tanh(x)
+    def _tansig(self, x):
+        return np.tanh(x)
 
-    def normalize_input(self, X_real):
-        Xc = np.clip(X_real, self.input_min, self.input_max)
+    def _normalize_input(self, X):
+        Xc = np.clip(X, self.input_min, self.input_max)
         return 2 * (Xc - self.input_min) / (self.input_max - self.input_min) - 1
 
-    def desnormalize_output(self, y_norm, ymin=-1.0, ymax=1.0):
-        return (y_norm - ymin) / (ymax - ymin)
+    def _denorm_output(self, y, ymin=-1.0, ymax=1.0):
+        # Mapea a [0..1]
+        return (y - ymin) / (ymax - ymin)
 
-    def _predict_single(self, x_norm):
-        z1 = self.IW.T @ x_norm + self.bias_IW
-        a1 = self.tansig(z1)
-        z2 = self.LW @ a1 + self.bias_out
-        return self.tansig(z2)
-
-    def predict(self, X_real):
-        X_norm = self.normalize_input(X_real.astype(float))
-        emerrel_pred = np.array([self._predict_single(x) for x in X_norm], dtype=float)
-
-        # Desnormalización y protección de dominios
-        emerrel_desnorm = np.clip(self.desnormalize_output(emerrel_pred), 0.0, 1.0)
-
-        # Acumulado (0–1) protegido
-        emerrel_cumsum = np.clip(np.cumsum(emerrel_desnorm), 0.0, None)
-
-        # Normalización para EMEAC (ajustar a tu validación)
+    def predict(self, X):
+        Xn = self._normalize_input(X.astype(float))
+        # Capa oculta (20 neuronas), salida 1 neurona
+        z1 = Xn @ self.IW + self.bias_IW  # (N,20)
+        a1 = self._tansig(z1)             # (N,20)
+        z2 = a1 @ self.LW + self.bias_out # (N,)
+        y  = self._tansig(z2)             # (N,)
+        emerrel_01 = self._denorm_output(y)            # (N,) en [0..1]
         valor_max_emeac = 8.05
-        emer_ac = np.clip(emerrel_cumsum / max(valor_max_emeac, 1e-9), 0.0, 1.0)
-
-        # Incremento diario de EMEAC (0–1)
+        emer_ac = np.cumsum(emerrel_01) / valor_max_emeac  # (N,)
         emerrel_diff = np.diff(emer_ac, prepend=0.0)
-        emerrel_diff = np.clip(emerrel_diff, 0.0, 1.0)
-
-        def clasificar(v):
-            if v < THR_BAJO_MEDIO: return "Bajo"
-            elif v <= THR_MEDIO_ALTO: return "Medio"
-            else: return "Alto"
-
-        riesgo = np.array([clasificar(v) for v in emerrel_diff], dtype=object)
-        return pd.DataFrame({"EMERREL(0-1)": emerrel_diff, "Nivel_Emergencia_relativa": riesgo})
+        return emerrel_diff, emer_ac
 
 @st.cache_resource
 def get_model():
     return PracticalANNModel()
 
-modelo = get_model()
+# ======== Colores globales consistentes ========
+HEX_GREEN  = "#00A651"   # verde
+HEX_YELLOW = "#FFC000"   # amarillo
+HEX_RED    = "#E53935"   # rojo
 
-# ================== Helpers CSV ==================
-def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza nombres de columnas:
-    - trim espacios
-    - minúsculas
-    - mapea alias comunes a nombres canónicos: Fecha, TMAX, TMIN, Prec, Julian_days
-    """
-    # 1) columnas normalizadas a minúsculas sin espacios
-    norm = {c: c.strip().lower() for c in df.columns}
-    df = df.rename(columns=norm)
+def rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
 
-    # 2) mapeo de alias -> canónicos
-    alias_map = {
-        "fecha": "Fecha",
-        "date": "Fecha",
-        "tmax": "TMAX",
-        "tmin": "TMIN",
-        "prec": "Prec",
-        "pp": "Prec",
-        "julian_days": "Julian_days",
-        "julian": "Julian_days",
-        "julianday": "Julian_days",
-        "jday": "Julian_days",
-    }
+COLOR_MAP_HEX = {"Bajo": HEX_GREEN, "Medio": HEX_YELLOW, "Alto": HEX_RED}
+MAP_NIVEL_ICONO = {"Bajo": "🟢 Bajo", "Medio": "🟡 Medio", "Alto": "🔴 Alto"}
 
-    for src, dst in alias_map.items():
-        if src in df.columns:
-            df = df.rename(columns={src: dst})
+# ======== Carga robusta del CSV (solo filas existentes) ========
+def load_history_only(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
+    # Intentar esquema B primero (por compatibilidad histórica)
+    try:
+        df = pd.read_csv(csv_path, parse_dates=["Fecha"])
+        if {"Fecha","Julian_days","TMAX","TMIN","Prec"}.issubset(df.columns):
+            pass
+        else:
+            raise ValueError("Schema B no coincide; pruebo A")
+    except Exception:
+        # Esquema A
+        df = pd.read_csv(csv_path, parse_dates=["date"])
+        if not {"date","tmax","tmin","prec"}.issubset(df.columns):
+            return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+        df = df.rename(columns={"date":"Fecha","tmax":"TMAX","tmin":"TMIN","prec":"Prec"})
+        df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.normalize()
+        df = df.sort_values("Fecha").reset_index(drop=True)
+        first = df["Fecha"].min()
+        df["Julian_days"] = (df["Fecha"] - first).dt.days + 1
+
+    # Coerción numérica y saneo básico
+    for c in ["TMAX","TMIN","Prec"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["Prec"] = df["Prec"].fillna(0).clip(lower=0)  # no negativos
+    df = (df.dropna(subset=["Fecha"])
+            .drop_duplicates("Fecha")
+            .sort_values("Fecha")
+            .reset_index(drop=True))
     return df
 
-def load_history_strict() -> pd.DataFrame:
-    """Lee exclusivamente meteo_history.csv. No reindexa ni inventa fechas."""
-    if not HISTORY_PATH.exists():
-        st.error(f"No se encontró {HISTORY_PATH.name}. Colocá el archivo en el directorio de la app.")
-        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+# ======== UI ========
+st.title("PREDWEEM — EUPHORBIA DAVIDII - BAHIA BLANCA 2025")
+st.caption("La app usa únicamente las filas existentes del CSV. No reindexa ni completa fechas faltantes.")
 
-    # Leer CSV (sin asumir tipos aún), normalizar nombres
-    try:
-        dfh = pd.read_csv(HISTORY_PATH)
-    except Exception as e:
-        st.error(f"No se pudo leer {HISTORY_PATH.name}: {e}")
-        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
-
-    dfh = _normalize_cols(dfh)
-
-    # Convertir tipos
-    if "Fecha" in dfh.columns:
-        dfh["Fecha"] = pd.to_datetime(dfh["Fecha"], errors="coerce").dt.normalize()
-
-    for c in ["TMAX","TMIN","Prec","Julian_days"]:
-        if c in dfh.columns:
-            dfh[c] = pd.to_numeric(dfh[c], errors="coerce")
-
-    if "Prec" in dfh.columns:
-        dfh["Prec"] = dfh["Prec"].fillna(0).clip(lower=0)
-
-    # Completar columnas faltantes a partir de la otra
-    base = pd.Timestamp("2025-09-01")
-    tiene_fecha = "Fecha" in dfh.columns and not dfh["Fecha"].isna().all()
-    tiene_jd    = "Julian_days" in dfh.columns and not dfh["Julian_days"].isna().all()
-
-    if not tiene_fecha and tiene_jd:
-        # Crear Fecha desde Julian_days
-        jd = pd.to_numeric(dfh["Julian_days"], errors="coerce")
-        dfh["Fecha"] = (base + pd.to_timedelta(jd - 1, unit="D")).dt.normalize()
-        tiene_fecha = True
-
-    if not tiene_jd and tiene_fecha:
-        # Crear Julian_days desde Fecha
-        dfh["Julian_days"] = (dfh["Fecha"] - base).dt.days + 1
-        tiene_jd = True
-
-    # Si no hay ninguna de las dos, avisar y salir
-    if not tiene_fecha and not tiene_jd:
-        st.error(
-            f"{HISTORY_PATH.name} debe incluir al menos 'Fecha' (o 'date') "
-            f"o 'Julian_days' (alias: julian, jday). Columnas encontradas: {list(dfh.columns)}"
-        )
-        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
-
-    # Ordenar + deduplicar por fecha si existe; si no, por Julian_days
-    if tiene_fecha:
-        dfh = dfh.dropna(subset=["Fecha"])
-        dfh = dfh.drop_duplicates("Fecha").sort_values("Fecha")
-    else:
-        dfh = dfh.dropna(subset=["Julian_days"])
-        dfh = dfh.drop_duplicates("Julian_days").sort_values("Julian_days")
-
-    # Columnas finales disponibles
-    keep_cols = [c for c in ["Fecha","Julian_days","TMAX","TMIN","Prec"] if c in dfh.columns]
-    dfh = dfh[keep_cols].reset_index(drop=True)
-
-    return dfh
-
-# ================== App (UI) ==================
-st.title("Predicción de Emergencia Agrícola EUPHO – OLAVARRIA")
-
-st.sidebar.header("Configuración")
-umbral_usuario = st.sidebar.number_input(
-    "Umbral ajustable de EMEAC para 100%", 5.0, 15.0, 14.0, 0.01, format="%.2f"
-)
-with st.sidebar:
-    if st.button("🔄 Forzar refresco/limpieza de caché"):
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        st.rerun()
-
-# (Opcional) visor rápido del CSV
-with st.expander("🔎 Previsualizar meteo_history.csv (opcional)"):
-    if HISTORY_PATH.exists():
-        try:
-            _raw = pd.read_csv(HISTORY_PATH)
-            st.write("Columnas detectadas:", list(_raw.columns))
-            st.dataframe(_raw.head(10))
-        except Exception as e:
-            st.warning(f"No se pudo previsualizar: {e}")
-    else:
-        st.info("No se encontró meteo_history.csv")
-
-def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
-    req = {"Julian_days","TMAX","TMIN","Prec"}
-    if not req.issubset(df.columns):
-        st.warning(f"{nombre}: faltan columnas {req - set(df.columns)}")
-        return
-
-    # Asegurar Fecha desde julianos si no vino explícita
-    if "Fecha" not in df.columns:
-        base = pd.Timestamp("2025-09-01")
-        jd = pd.to_numeric(df["Julian_days"], errors="coerce")
-        df["Fecha"] = (base + pd.to_timedelta(jd - 1, unit="D")).dt.normalize()
-    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-
-    # Ordenar + deduplicar por fecha (sin crear nuevas fechas)
-    df = (
-        df.sort_values("Fecha")
-          .drop_duplicates("Fecha")
-          .reset_index(drop=True)
-    )
-
-    # Recorte por ventana conceptual (sin reindex; NO inventar días)
-    m_vis = (df["Fecha"] >= START_SERIE) & (df["Fecha"] <= END_SERIE)
-    df_vis = df.loc[m_vis].copy()
-
-    if df_vis.empty:
-        st.warning(
-            f"{nombre}: no hay datos dentro de la ventana "
-            f"{START_SERIE.date()} → {END_SERIE.date()}. "
-            "Revisá que el CSV tenga fechas en ese rango."
-        )
-        return
-
-    # Sanitizado suave (sin inventar valores)
-    for c in ["TMAX","TMIN","Prec"]:
-        df_vis[c] = pd.to_numeric(df_vis[c], errors="coerce")
-    df_vis["Prec"] = df_vis["Prec"].fillna(0).clip(lower=0)
-
-    # Recalcular julianos por consistencia
-    base = pd.Timestamp("2025-09-01")
-    df_vis["Julian_days"] = (df_vis["Fecha"] - base).dt.days + 1
-
-    # ====== Modelo ======
-    X_real = df_vis[["Julian_days","TMAX","TMIN","Prec"]].to_numpy(float)
-    fechas = df_vis["Fecha"]
-    pred = modelo.predict(X_real)
-
-    pred["Fecha"] = fechas
-    pred["Julian_days"] = df_vis["Julian_days"].to_numpy()
-    pred["EMERREL acumulado"] = pred["EMERREL(0-1)"].cumsum()
-
-    # Bandas EMEAC
-    pred["EMEAC (0-1) - mínimo"]    = pred["EMERREL acumulado"] / EMEAC_MIN_DEN
-    pred["EMEAC (0-1) - máximo"]    = pred["EMERREL acumulado"] / EMEAC_MAX_DEN
-    pred["EMEAC (0-1) - ajustable"] = pred["EMERREL acumulado"] / umbral_usuario
-    for col in ["EMEAC (0-1) - mínimo","EMEAC (0-1) - máximo","EMEAC (0-1) - ajustable"]:
-        pred[col.replace("(0-1)","(%)")] = (pred[col]*100).clip(0,100)
-
-    # Regla estética: cuando EMEAC ajustable < 10%, forzar "Bajo"
-    pred.loc[pred["EMEAC (%) - ajustable"] < 10.0, "Nivel_Emergencia_relativa"] = "Bajo"
-
-    pred["EMERREL_MA5"] = pred["EMERREL(0-1)"].rolling(5, 1).mean()
-
-    # ====== Figuras (ejes X fijos a la ventana completa) ======
-    st.subheader(f"EMERGENCIA RELATIVA DIARIA — {nombre}")
-    colores = pred["Nivel_Emergencia_relativa"].map(COLOR_MAP).fillna(COLOR_FALLBACK).tolist()
-    fig_er = go.Figure()
-    fig_er.add_bar(
-        x=pred["Fecha"],
-        y=pred["EMERREL(0-1)"],
-        marker=dict(color=colores),
-        customdata=pred["Nivel_Emergencia_relativa"],
-        hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
-        name="EMERREL"
-    )
-    fig_er.add_scatter(x=pred["Fecha"], y=pred["EMERREL_MA5"], mode="lines", name="MA5")
-    fig_er.update_xaxes(
-        range=[str(VENTANA_MIN.date()), str(VENTANA_MAX.date())],
-        dtick="M1", tickformat="%b"
-    )
-    fig_er.update_yaxes(range=[0, 0.08])  # EMERREL: Y fijo 0–0.08
-    st.plotly_chart(fig_er, use_container_width=True)
-
-    st.subheader(f"EMERGENCIA ACUMULADA DIARIA — {nombre}")
-    fig_acc = go.Figure()
-    fig_acc.add_scatter(x=pred["Fecha"], y=pred["EMEAC (%) - mínimo"], mode="lines", line=dict(width=0), name="EMEAC mín")
-    fig_acc.add_scatter(x=pred["Fecha"], y=pred["EMEAC (%) - máximo"], mode="lines", line=dict(width=0), fill="tonexty", name="EMEAC máx")
-    fig_acc.add_scatter(x=pred["Fecha"], y=pred["EMEAC (%) - ajustable"], mode="lines", line=dict(width=2.5), name=f"Ajustable /{umbral_usuario:.2f}")
-    fig_acc.update_traces(hovertemplate="%{x|%d-%b-%Y}<br>%{y:.1f}%<extra></extra>")
-    fig_acc.update_yaxes(range=[0, 100])  # EMEAC: Y fijo 0–100%
-    fig_acc.update_xaxes(
-        range=[str(VENTANA_MIN.date()), str(VENTANA_MAX.date())],
-        dtick="M1", tickformat="%b"
-    )
-    st.plotly_chart(fig_acc, use_container_width=True)
-
-    # ====== Tabla ======
-    st.subheader(f"Resultados (solo fechas con datos) — {nombre}")
-    tabla = pred[["Fecha","Julian_days","Nivel_Emergencia_relativa"]].copy()
-    tabla["EMEAC (%)"] = pred["EMEAC (%) - ajustable"]
-    iconos = {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
-    tabla["Nivel_Emergencia_relativa"] = tabla["Nivel_Emergencia_relativa"].map(iconos)
-    tabla = tabla.rename(columns={"Nivel_Emergencia_relativa": "Nivel de EMERREL"})
-    st.dataframe(tabla, use_container_width=True)
-
-    st.download_button(
-        "Descargar CSV",
-        tabla.to_csv(index=False).encode("utf-8"),
-        f"{nombre}_resultados.csv",
-        "text/csv"
-    )
-
-# ================== Flujo principal ==================
-st.markdown("—")
-
-# 1) Leer EXCLUSIVAMENTE meteo_history.csv
-df_hist = load_history_strict()
-
-# 2) Mostrar usando la serie consolidada tal cual (no se borran fechas antiguas; no se crean fechas nuevas)
-if df_hist.empty:
+dfh = load_history_only(CSV_PATH)
+if dfh.empty:
+    st.error("No hay filas utilizables en meteo_history.csv. Verificá columnas y datos.")
     st.stop()
-else:
-    # Mensaje de cobertura temporal del CSV
-    if "Fecha" in df_hist.columns and not df_hist["Fecha"].isna().all():
-        st.success(f"History: {df_hist['Fecha'].min().date()} → {df_hist['Fecha'].max().date()} · {len(df_hist)} día(s)")
-    elif "Julian_days" in df_hist.columns and not df_hist["Julian_days"].isna().all():
-        st.success(f"History (por Julian_days): {int(df_hist['Julian_days'].min())} → {int(df_hist['Julian_days'].max())} · {len(df_hist)} día(s)")
-    else:
-        st.success(f"History cargado: {len(df_hist)} fila(s)")
 
-    procesar_y_mostrar(df_hist, "meteo_history.csv")
+st.success(f"Horizonte detectado: {dfh['Fecha'].min().date()} → {dfh['Fecha'].max().date()} · {len(dfh)} día(s)")
+
+# ======== Predicción ========
+modelo = get_model()
+X = dfh[["Julian_days","TMAX","TMIN","Prec"]].to_numpy(float)
+emerrel, emeac01 = modelo.predict(X)
+
+pred = pd.DataFrame({
+    "Fecha": dfh["Fecha"].to_numpy(),
+    "Julian_days": dfh["Julian_days"].to_numpy(),
+    "EMERREL(0-1)": emerrel,
+    "EMEAC(0-1)": emeac01
+})
+
+# --- Robust: asegurar numérico antes de rolling ---
+for _c in ["EMERREL(0-1)", "EMEAC(0-1)"]:
+    if _c in pred.columns:
+        pred[_c] = pd.to_numeric(pred[_c], errors="coerce")
+pred["EMERREL(0-1)"] = pred["EMERREL(0-1)"].fillna(0)
+# --- Garantía EMEAC ---
+if "EMEAC(0-1)" not in pred.columns or pred["EMEAC(0-1)"].isna().all():
+    _acc = pred["EMERREL(0-1)"].cumsum()
+    _den = 8.05  # máximo de referencia
+    pred["EMEAC(0-1)"] = (_acc / _den).clip(lower=0)
+else:
+    pred["EMEAC(0-1)"] = pd.to_numeric(pred["EMEAC(0-1)"], errors="coerce").fillna(0)
+
+pred["EMEAC(%)"] = (pred["EMEAC(0-1)"] * 100).clip(0, 100)
+pred["EMERREL_MA5"] = pred["EMERREL(0-1)"].rolling(window=5, min_periods=1).mean()
+
+# Clasificación simple del nivel diario según EMERREL
+THR_BAJO_MEDIO = 0.02
+THR_MEDIO_ALTO = 0.079
+def nivel(v):
+    if v < THR_BAJO_MEDIO: return "Bajo"
+    elif v <= THR_MEDIO_ALTO: return "Medio"
+    else: return "Alto"
+pred["Nivel"] = pred["EMERREL(0-1)"].apply(nivel)
+
+# ======== Gráfico EMERREL diario ========
+st.subheader("EMERGENCIA RELATIVA")
+# Barras por nivel (paleta consistente)
+bar_colors = pred["Nivel"].map(COLOR_MAP_HEX).fillna("#B0B0B0")
+
+fig1 = go.Figure()
+fig1.add_bar(
+    x=pred["Fecha"],
+    y=pred["EMERREL(0-1)"],
+    marker=dict(color=bar_colors),
+    customdata=pred["Nivel"],
+    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
+    name="EMERREL"
+)
+
+# --- Relleno tricolor INTERNO bajo la MA5 ---
+x = pred["Fecha"]
+ma = pred["EMERREL_MA5"].fillna(0.0).clip(lower=0.0).to_numpy()
+
+y_low = float(THR_BAJO_MEDIO)   # verde hasta aquí
+y_med = float(THR_MEDIO_ALTO)   # amarillo hasta aquí; de ahí en más rojo
+
+# Topes de cada banda
+y0 = np.zeros_like(ma)
+y1 = np.minimum(ma, y_low)   # [0 .. y_low] -> verde
+y2 = np.minimum(ma, y_med)   # [y_low .. y_med] -> amarillo (rellena contra y1)
+y3 = ma                      # [y_med .. ma] -> rojo (rellena contra y2)
+
+ALPHA = 0.70  # opacidad suave
+fig1.add_trace(go.Scatter(x=x, y=y0, mode="lines",
+                          line=dict(width=0), hoverinfo="skip", showlegend=False))
+fig1.add_trace(go.Scatter(x=x, y=y1, mode="lines",
+                          line=dict(width=0), fill="tonexty", fillcolor=rgba(HEX_GREEN, ALPHA),
+                          hoverinfo="skip", showlegend=False, name="Zona baja"))
+fig1.add_trace(go.Scatter(x=x, y=y1, mode="lines",
+                          line=dict(width=0), hoverinfo="skip", showlegend=False))
+fig1.add_trace(go.Scatter(x=x, y=y2, mode="lines",
+                          line=dict(width=0), fill="tonexty", fillcolor=rgba(HEX_YELLOW, ALPHA),
+                          hoverinfo="skip", showlegend=False, name="Zona media"))
+fig1.add_trace(go.Scatter(x=x, y=y2, mode="lines",
+                          line=dict(width=0), hoverinfo="skip", showlegend=False))
+fig1.add_trace(go.Scatter(x=x, y=y3, mode="lines",
+                          line=dict(width=0), fill="tonexty", fillcolor=rgba(HEX_RED, ALPHA),
+                          hoverinfo="skip", showlegend=False, name="Zona alta"))
+
+# Línea de MA5 por encima
+fig1.add_scatter(
+    x=pred["Fecha"],
+    y=pred["EMERREL_MA5"],
+    mode="lines",
+    line=dict(color="black", width=2),
+    name="MA5"
+)
+
+# Eje razonable para tu escala
+fig1.update_yaxes(range=[0, 0.08])
+fig1.update_layout(xaxis_title="Fecha", yaxis_title="EMERREL (0-1)",
+                   hovermode="x unified", legend_title="Referencias", height=560)
+st.plotly_chart(fig1, use_container_width=True)
+
+# ======== Gráfico EMEAC (%) ========
+st.subheader("EMEAC acumulada (%)")
+# Banda mín/máx de referencia (denominadores fijos)
+EMEAC_MIN_DEN = 5.0
+EMEAC_MAX_DEN = 15.0
+
+acc = pred["EMERREL(0-1)"].cumsum()
+emeac_min = (acc / EMEAC_MIN_DEN * 100).clip(0, 100)
+emeac_max = (acc / EMEAC_MAX_DEN * 100).clip(0, 100)
+
+fig2 = go.Figure()
+fig2.add_scatter(x=pred["Fecha"], y=emeac_min, mode="lines", line=dict(width=0), name="EMEAC mín")
+fig2.add_scatter(x=pred["Fecha"], y=emeac_max, mode="lines", line=dict(width=0),
+                 fill="tonexty", fillcolor="rgba(120,120,120,0.20)", name="EMEAC máx")
+fig2.add_scatter(x=pred["Fecha"], y=pred["EMEAC(%)"], mode="lines",
+                 line=dict(width=2.5), name="EMEAC (%) (modelo)")
+fig2.update_yaxes(range=[0, 100])
+fig2.update_layout(xaxis_title="Fecha", yaxis_title="EMEAC (%)",
+                   hovermode="x unified", legend_title="Referencias", height=520)
+st.plotly_chart(fig2, use_container_width=True)
+
+# ======== Tabla ========
+st.subheader("Resultados diarios (horizonte del CSV)")
+tabla = pred[["Fecha","Julian_days","EMERREL(0-1)","EMERREL_MA5","EMEAC(%)","Nivel"]].copy()
+tabla["Nivel"] = tabla["Nivel"].map(MAP_NIVEL_ICONO)
+st.dataframe(tabla, use_container_width=True)
+
+st.download_button(
+    "Descargar resultados (CSV)",
+    tabla.to_csv(index=False).encode("utf-8"),
+    "resultados_predweem_horizonte_history.csv",
+    "text/csv"
+)
+
+with st.expander("🔍 QA de consistencia EMERREL/EMEAC"):
+    # 1) Tipos y NaN
+    emerrel_ok_num = pd.api.types.is_numeric_dtype(pred["EMERREL(0-1)"])
+    emeac_ok_num   = pd.api.types.is_numeric_dtype(pred["EMEAC(0-1)"])
+    emerrel_no_nan = not pred["EMERREL(0-1)"].isna().any()
+    emeac_no_nan   = not pred["EMEAC(0-1)"].isna().any()
+
+    # 2) Invariantes
+    emeac_monot = pred["EMEAC(0-1)"].is_monotonic_increasing
+    emeac_bounds = float(pred["EMEAC(0-1)"].min()) >= 0.0 and float(pred["EMEAC(0-1)"].max()) <= 1.0 + 1e-9
+    emerrel_nonneg = (pred["EMERREL(0-1)"] >= -1e-9).mean() >= 0.99
+
+    # 3) Consistencia EMEAC vs suma de EMERREL
+    acc_from_emerrel = pred["EMERREL(0-1)"].cumsum()
+    residual = (pred["EMEAC(0-1)"] - acc_from_emerrel).astype(float)
+    rmse = float((residual**2).mean()**0.5) if len(residual) else 0.0
+
+    cols = st.columns(2)
+    with cols[0]:
+        st.write("**Tipos/NaN**")
+        st.write({"emerrel_numeric": emerrel_ok_num,
+                  "emeac_numeric": emeac_ok_num,
+                  "no_nan_emerrel": emerrel_no_nan,
+                  "no_nan_emeac": emeac_no_nan})
+    with cols[1]:
+        st.write("**Invariantes**")
+        st.write({"emeac_monotonic_non_decreasing": emeac_monot,
+                  "emeac_bounds_0_1": emeac_bounds,
+                  "emerrel_non_negative_mostly": emerrel_nonneg,
+                  "consistency_emerrel_to_emeac_RMSE": rmse})
+
+    if not (emerrel_ok_num and emeac_ok_num and emerrel_no_nan and emeac_no_nan and emeac_monot and emeac_bounds and emerrel_nonneg):
+        st.warning("⚠️ Algún check falló. Revisá NaN/tipos en meteo_history.csv o activá imputación cauta (ver abajo).")
+
+    st.markdown("""
+    <details><summary><b>Imputación cauta sugerida (opcional)</b></summary>
+    <pre>
+    # Antes de armar X:
+    # dfh[["TMAX","TMIN"]] = dfh[["TMAX","TMIN"]].ffill(limit=1)
+    # dfh["Prec"] = dfh["Prec"].fillna(0)
+    # dfh = dfh.dropna(subset=["TMAX","TMIN","Prec"])
+    </pre>
+    </details>
+    """, unsafe_allow_html=True)
