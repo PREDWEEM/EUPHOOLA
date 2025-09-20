@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
-# streamlit_emergencia_app_persistente_sin_reindex.py
-# EUPHO – Serie persistente (no borra días previos), SIN reindex (no inventa fechas),
+# streamlit_emergencia_app_persistente_csv_only.py
+# EUPHO – Serie persistente (solo lee meteo_history.csv), SIN reindex (no inventa fechas),
 # ventana de gráficos fija: 2025-09-01 → 2026-01-01
 # EMERREL: eje Y fijo 0–0.08 · EMEAC: eje Y fijo 0–100%
 
-import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.request import urlopen, Request
 
 import streamlit as st
 import numpy as np
@@ -15,40 +13,6 @@ import plotly.graph_objects as go
 
 # ================== Config de página ==================
 st.set_page_config(page_title="Predicción de Emergencia Agrícola EUPHO – OLAVARRIA", layout="wide")
-
-# ================== UX: embebido y recarga ==================
-def _get_query_params():
-    try:
-        qp = st.query_params  # Streamlit modernos
-        if isinstance(qp, dict):
-            return {k: [v] if isinstance(v, str) else v for k, v in qp.items()}
-        return dict(qp)
-    except Exception:
-        try:
-            return st.experimental_get_query_params()
-        except Exception:
-            return {}
-
-def is_embedded() -> bool:
-    qp = _get_query_params()
-    val = str(qp.get("embed", [""])[0]).lower()
-    return val in {"1", "true", "yes"}
-
-def app_base_url() -> str:
-    return "https://appemergenciapy-lscuxqt2j3sa9yjrwgyqnh.streamlit.app/"
-
-if is_embedded():
-    st.info("Esta app está embebida. Si no arranca o quedó dormida, ábrela en una pestaña nueva o reintenta la carga.")
-    colA, colB = st.columns(2)
-    with colA:
-        st.link_button("🔗 Abrir app completa", app_base_url())
-    with colB:
-        if st.button("🔁 Reintentar (limpiar caché y recargar)"):
-            try:
-                st.cache_data.clear()
-            except Exception:
-                pass
-            st.rerun()
 
 # ================== Constantes visuales y modelo ==================
 THR_BAJO_MEDIO = 0.02
@@ -59,9 +23,6 @@ COLOR_FALLBACK = "#808080"
 EMEAC_MIN_DEN = 5.0   # Banda inferior
 EMEAC_MAX_DEN = 15.0  # Banda superior
 
-# API Bahía Blanca
-API_URL = "https://meteobahia.com.ar/scripts/forecast/for-ol.xml"
-
 # Ventana conceptual (para recorte y para los ejes de los gráficos)
 VENTANA_MIN = pd.Timestamp("2025-09-01")
 VENTANA_MAX = pd.Timestamp("2026-01-01")
@@ -69,7 +30,7 @@ START_SERIE = VENTANA_MIN
 END_SERIE   = VENTANA_MAX
 st.caption(f"Ventana fija en gráficos: {START_SERIE.date()} → {END_SERIE.date()} (se dibujan solo fechas con datos reales)")
 
-# Archivo local para persistir el consolidado (histórico ∪ pronósticos)
+# Archivo local para lectura (única fuente)
 HISTORY_PATH = Path("meteo_history.csv")
 
 # ================== Modelo ANN ==================
@@ -119,13 +80,20 @@ class PracticalANNModel:
     def predict(self, X_real):
         X_norm = self.normalize_input(X_real.astype(float))
         emerrel_pred = np.array([self._predict_single(x) for x in X_norm], dtype=float)
-        emerrel_desnorm = self.desnormalize_output(emerrel_pred)
-        emerrel_cumsum = np.cumsum(emerrel_desnorm)
+
+        # Desnormalización y protección de dominios
+        emerrel_desnorm = np.clip(self.desnormalize_output(emerrel_pred), 0.0, 1.0)
+
+        # Acumulado (0–1) protegido
+        emerrel_cumsum = np.clip(np.cumsum(emerrel_desnorm), 0.0, None)
 
         # Normalización para EMEAC (ajustar a tu validación)
         valor_max_emeac = 8.05
-        emer_ac = emerrel_cumsum / valor_max_emeac
+        emer_ac = np.clip(emerrel_cumsum / max(valor_max_emeac, 1e-9), 0.0, 1.0)
+
+        # Incremento diario de EMEAC (0–1)
         emerrel_diff = np.diff(emer_ac, prepend=0.0)
+        emerrel_diff = np.clip(emerrel_diff, 0.0, 1.0)
 
         def clasificar(v):
             if v < THR_BAJO_MEDIO: return "Bajo"
@@ -141,117 +109,67 @@ def get_model():
 
 modelo = get_model()
 
-# ================== Helpers API ==================
-@st.cache_data(ttl=15*60, show_spinner=False)
-def _fetch_xml(url: str) -> bytes:
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Streamlit MeteoBahia)"})
-    with urlopen(req, timeout=20) as r:
-        return r.read()
+# ================== Helpers CSV ==================
+def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Acepta columnas en may/min: Fecha/fecha, TMAX/tmax, TMIN/tmin, Prec/prec, Julian_days/julian_days"""
+    rename_map = {}
+    cols = {c.lower(): c for c in df.columns}
+    if "fecha" in cols:       rename_map[cols["fecha"]] = "Fecha"
+    if "tmax" in cols:        rename_map[cols["tmax"]] = "TMAX"
+    if "tmin" in cols:        rename_map[cols["tmin"]] = "TMIN"
+    if "prec" in cols:        rename_map[cols["prec"]] = "Prec"
+    if "julian_days" in cols: rename_map[cols["julian_days"]] = "Julian_days"
+    return df.rename(columns=rename_map)
 
-def fetch_xml_with_feedback(url: str, retries: int = 2) -> bytes:
-    last_err = None
-    with st.spinner("Conectando a MeteoBahia..."):
-        for _ in range(retries):
-            try:
-                return _fetch_xml(url)
-            except Exception as e:
-                last_err = e
-    raise last_err if last_err else RuntimeError("Error desconocido al leer la API")
+def load_history_strict() -> pd.DataFrame:
+    """Lee exclusivamente meteo_history.csv. No reindexa, no inventa fechas."""
+    if not HISTORY_PATH.exists():
+        st.error(f"No se encontró {HISTORY_PATH.name}. Colocá el archivo en el directorio de la app.")
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-@st.cache_data(ttl=15*60, show_spinner=False)
-def parse_meteobahia_xml(xml_bytes: bytes) -> pd.DataFrame:
-    root = ET.fromstring(xml_bytes)
-    rows = []
-    for day in root.findall(".//day"):
-        fecha_tag  = day.find("fecha")
-        tmax_tag   = day.find("tmax")
-        tmin_tag   = day.find("tmin")
-        precip_tag = day.find("precip")
-        if fecha_tag is None or "value" not in (fecha_tag.attrib or {}):
-            continue
-        fecha_str = str(fecha_tag.attrib.get("value", "")).strip()
-        fecha = pd.to_datetime(fecha_str, errors="coerce")
-        if pd.isna(fecha):
-            continue
+    try:
+        # Intento 1: respetando tipos
+        dfh = pd.read_csv(HISTORY_PATH, parse_dates=["Fecha"])
+    except Exception:
+        # Intento 2: leer crudo y normalizar nombres luego
+        dfh = pd.read_csv(HISTORY_PATH)
+        dfh = _normalize_cols(dfh)
+        if "Fecha" in dfh.columns:
+            dfh["Fecha"] = pd.to_datetime(dfh["Fecha"], errors="coerce")
 
-        def _to_float_attr(tag):
-            if tag is None: return None
-            s = str(tag.attrib.get("value", "")).strip().replace(",", ".")
-            try: return float(s)
-            except: return None
+    dfh = _normalize_cols(dfh)
+    # Sanitizado suave
+    if "Fecha" in dfh.columns:
+        dfh["Fecha"] = pd.to_datetime(dfh["Fecha"], errors="coerce").dt.normalize()
+    for c in ["TMAX","TMIN","Prec","Julian_days"]:
+        if c in dfh.columns:
+            dfh[c] = pd.to_numeric(dfh[c], errors="coerce")
+    if "Prec" in dfh.columns:
+        dfh["Prec"] = dfh["Prec"].fillna(0).clip(lower=0)
 
-        tmax = _to_float_attr(tmax_tag)
-        tmin = _to_float_attr(tmin_tag)
-        prec = _to_float_attr(precip_tag) or 0.0
-
-        rows.append({"Fecha": fecha.normalize(), "TMAX": tmax, "TMIN": tmin, "Prec": prec})
-
-    df = pd.DataFrame(rows).drop_duplicates("Fecha").sort_values("Fecha").reset_index(drop=True)
-
-    # Interpolaciones SUAVES en columnas numéricas existentes (no crea fechas nuevas)
-    for col in ["TMAX", "TMIN", "Prec"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").interpolate(limit_direction="both")
-    df["Prec"] = df["Prec"].fillna(0).clip(lower=0)
-
-    # Base juliana respecto de 2025-09-01
+    # Si no hay Julian_days, lo calculamos desde base
     base = pd.Timestamp("2025-09-01")
-    df["Julian_days"] = (df["Fecha"] - base).dt.days + 1
-    return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
-
-# ================== Persistencia (history) ==================
-def load_history() -> pd.DataFrame:
-    if HISTORY_PATH.exists():
-        try:
-            dfh = pd.read_csv(HISTORY_PATH, parse_dates=["Fecha"])
-            dfh["Fecha"] = pd.to_datetime(dfh["Fecha"]).dt.normalize()
-            # Recalcular julianos por consistencia
-            base = pd.Timestamp("2025-09-01")
+    if "Julian_days" not in dfh.columns or dfh["Julian_days"].isna().all():
+        if "Fecha" in dfh.columns:
             dfh["Julian_days"] = (dfh["Fecha"] - base).dt.days + 1
-            for c in ["TMAX","TMIN","Prec"]:
-                dfh[c] = pd.to_numeric(dfh[c], errors="coerce")
-            dfh["Prec"] = dfh["Prec"].fillna(0).clip(lower=0)
-            return dfh.drop_duplicates("Fecha").sort_values("Fecha").reset_index(drop=True)
-        except Exception:
-            pass
-    return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-def update_history(df_new: pd.DataFrame, freeze_existing: bool = False) -> pd.DataFrame:
-    """
-    Fusiona history existente con df_new.
-    - freeze_existing=False (por defecto): la API más reciente PISA fechas repetidas (keep='last').
-    - freeze_existing=True: NO sobrescribe fechas ya guardadas; solo agrega fechas nuevas.
-    """
-    dfh = load_history()
-    if dfh.empty:
-        merged = df_new.copy()
-    else:
-        if freeze_existing:
-            nuevas = df_new[~df_new["Fecha"].isin(dfh["Fecha"])]
-            merged = pd.concat([dfh, nuevas], ignore_index=True)
-        else:
-            merged = (
-                pd.concat([dfh, df_new], ignore_index=True)
-                  .sort_values("Fecha")
-                  .drop_duplicates(subset=["Fecha"], keep="last")
-            )
+    # Ordenar + deduplicar por fecha (sin crear nuevas fechas)
+    keep_cols = [c for c in ["Fecha","Julian_days","TMAX","TMIN","Prec"] if c in dfh.columns]
+    dfh = (dfh[keep_cols]
+           .dropna(subset=["Fecha"])
+           .drop_duplicates("Fecha")
+           .sort_values("Fecha")
+           .reset_index(drop=True))
 
-    merged = merged.sort_values("Fecha").drop_duplicates("Fecha").reset_index(drop=True)
-    merged.to_csv(HISTORY_PATH, index=False)
-    return merged
+    return dfh
 
 # ================== App (UI) ==================
-st.title("Predicción de Emergencia Agrícola EUPHO –OLAVARRIA")
+st.title("Predicción de Emergencia Agrícola EUPHO – OLAVARRIA")
 
 st.sidebar.header("Configuración")
 umbral_usuario = st.sidebar.number_input(
     "Umbral ajustable de EMEAC para 100%", 5.0, 15.0, 14.0, 0.01, format="%.2f"
 )
-FREEZE_HISTORY = st.sidebar.checkbox(
-    "Congelar pronósticos previos (no sobrescribir)", value=True,
-    help="Si está activado, cada corrida queda congelada: no se pisan valores previos para la misma fecha."
-)
-fuente = st.sidebar.radio("Fuente de datos meteorológicos", ["API MeteoBahia", "Subir Excel (.xlsx)"], index=0)
-
 with st.sidebar:
     if st.button("🔄 Forzar refresco/limpieza de caché"):
         try:
@@ -285,7 +203,11 @@ def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
     df_vis = df.loc[m_vis].copy()
 
     if df_vis.empty:
-        st.warning(f"{nombre}: no hay datos en {START_SERIE.date()} → {END_SERIE.date()}")
+        st.warning(
+            f"{nombre}: no hay datos dentro de la ventana "
+            f"{START_SERIE.date()} → {END_SERIE.date()}. "
+            "Revisá que el CSV tenga fechas en ese rango."
+        )
         return
 
     # Sanitizado suave (sin inventar valores)
@@ -343,6 +265,7 @@ def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
     fig_acc.add_scatter(x=pred["Fecha"], y=pred["EMEAC (%) - mínimo"], mode="lines", line=dict(width=0), name="EMEAC mín")
     fig_acc.add_scatter(x=pred["Fecha"], y=pred["EMEAC (%) - máximo"], mode="lines", line=dict(width=0), fill="tonexty", name="EMEAC máx")
     fig_acc.add_scatter(x=pred["Fecha"], y=pred["EMEAC (%) - ajustable"], mode="lines", line=dict(width=2.5), name=f"Ajustable /{umbral_usuario:.2f}")
+    fig_acc.update_traces(hovertemplate="%{x|%d-%b-%Y}<br>%{y:.1f}%<extra></extra>")
     fig_acc.update_yaxes(range=[0, 100])  # EMEAC: Y fijo 0–100%
     fig_acc.update_xaxes(
         range=[str(VENTANA_MIN.date()), str(VENTANA_MAX.date())],
@@ -369,43 +292,12 @@ def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
 # ================== Flujo principal ==================
 st.markdown("—")
 
-if fuente == "API MeteoBahia":
-    try:
-        xml_bytes = fetch_xml_with_feedback(API_URL)
-        df_api = parse_meteobahia_xml(xml_bytes)
-    except Exception as e:
-        st.error(f"No se pudo leer la API MeteoBahia: {e}")
-        # Aún así, si hay history, mostrarlo
-        df_hist = load_history()
-        if not df_hist.empty:
-            st.info("Mostrando datos persistidos (history) por indisponibilidad temporal de la API.")
-            procesar_y_mostrar(df_hist, "Persistido (sin API)")
-    else:
-        if df_api.empty:
-            st.error("La API no devolvió datos utilizables.")
-            df_hist = load_history()
-            if not df_hist.empty:
-                st.info("Mostrando datos persistidos (history).")
-                procesar_y_mostrar(df_hist, "Persistido (sin API)")
-        else:
-            st.success(f"API MeteoBahia: {df_api['Fecha'].min().date()} → {df_api['Fecha'].max().date()} · {len(df_api)} día(s)")
-            # 1) Actualizar history con el nuevo bloque de pronóstico (con opción de congelar)
-            df_merged = update_history(df_api, freeze_existing=FREEZE_HISTORY)
-            st.caption(f"History consolidado: {df_merged['Fecha'].min().date()} → {df_merged['Fecha'].max().date()} · {len(df_merged)} día(s)")
-            # 2) Mostrar usando la serie consolidada (no se borran fechas antiguas; no se crean fechas nuevas)
-            procesar_y_mostrar(df_merged, "MeteoBahia + History")
+# 1) Leer EXCLUSIVAMENTE meteo_history.csv
+df_hist = load_history_strict()
+
+# 2) Mostrar usando la serie consolidada tal cual (no se borran fechas antiguas; no se crean fechas nuevas)
+if df_hist.empty:
+    st.stop()
 else:
-    uploaded_files = st.file_uploader(
-        "Sube uno o más .xlsx con columnas: Julian_days, TMAX, TMIN, Prec (Fecha opcional)",
-        type=["xlsx"],
-        accept_multiple_files=True
-    )
-    if uploaded_files:
-        for file in uploaded_files:
-            try:
-                df = pd.read_excel(file)
-                procesar_y_mostrar(df, Path(file.name).stem)
-            except Exception as e:
-                st.warning(f"No se pudo leer {file.name}: {e}")
-    else:
-        st.info("Sube al menos un archivo .xlsx para iniciar el análisis.")
+    st.success(f"History: {df_hist['Fecha'].min().date()} → {df_hist['Fecha'].max().date()} · {len(df_hist)} día(s)")
+    procesar_y_mostrar(df_hist, "meteo_history.csv")
