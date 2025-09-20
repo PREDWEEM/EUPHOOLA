@@ -111,55 +111,97 @@ modelo = get_model()
 
 # ================== Helpers CSV ==================
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Acepta columnas en may/min: Fecha/fecha, TMAX/tmax, TMIN/tmin, Prec/prec, Julian_days/julian_days"""
-    rename_map = {}
-    cols = {c.lower(): c for c in df.columns}
-    if "fecha" in cols:       rename_map[cols["fecha"]] = "Fecha"
-    if "tmax" in cols:        rename_map[cols["tmax"]] = "TMAX"
-    if "tmin" in cols:        rename_map[cols["tmin"]] = "TMIN"
-    if "prec" in cols:        rename_map[cols["prec"]] = "Prec"
-    if "julian_days" in cols: rename_map[cols["julian_days"]] = "Julian_days"
-    return df.rename(columns=rename_map)
+    """
+    Normaliza nombres de columnas:
+    - trim espacios
+    - minúsculas
+    - mapea alias comunes a nombres canónicos: Fecha, TMAX, TMIN, Prec, Julian_days
+    """
+    # 1) columnas normalizadas a minúsculas sin espacios
+    norm = {c: c.strip().lower() for c in df.columns}
+    df = df.rename(columns=norm)
+
+    # 2) mapeo de alias -> canónicos
+    alias_map = {
+        "fecha": "Fecha",
+        "date": "Fecha",
+        "tmax": "TMAX",
+        "tmin": "TMIN",
+        "prec": "Prec",
+        "pp": "Prec",
+        "julian_days": "Julian_days",
+        "julian": "Julian_days",
+        "julianday": "Julian_days",
+        "jday": "Julian_days",
+    }
+
+    for src, dst in alias_map.items():
+        if src in df.columns:
+            df = df.rename(columns={src: dst})
+
+    return df
 
 def load_history_strict() -> pd.DataFrame:
-    """Lee exclusivamente meteo_history.csv. No reindexa, no inventa fechas."""
+    """Lee exclusivamente meteo_history.csv. No reindexa ni inventa fechas."""
     if not HISTORY_PATH.exists():
         st.error(f"No se encontró {HISTORY_PATH.name}. Colocá el archivo en el directorio de la app.")
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
+    # Leer CSV (sin asumir tipos aún), normalizar nombres
     try:
-        # Intento 1: respetando tipos
-        dfh = pd.read_csv(HISTORY_PATH, parse_dates=["Fecha"])
-    except Exception:
-        # Intento 2: leer crudo y normalizar nombres luego
         dfh = pd.read_csv(HISTORY_PATH)
-        dfh = _normalize_cols(dfh)
-        if "Fecha" in dfh.columns:
-            dfh["Fecha"] = pd.to_datetime(dfh["Fecha"], errors="coerce")
+    except Exception as e:
+        st.error(f"No se pudo leer {HISTORY_PATH.name}: {e}")
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
     dfh = _normalize_cols(dfh)
-    # Sanitizado suave
+
+    # Convertir tipos
     if "Fecha" in dfh.columns:
         dfh["Fecha"] = pd.to_datetime(dfh["Fecha"], errors="coerce").dt.normalize()
+
     for c in ["TMAX","TMIN","Prec","Julian_days"]:
         if c in dfh.columns:
             dfh[c] = pd.to_numeric(dfh[c], errors="coerce")
+
     if "Prec" in dfh.columns:
         dfh["Prec"] = dfh["Prec"].fillna(0).clip(lower=0)
 
-    # Si no hay Julian_days, lo calculamos desde base
+    # Completar columnas faltantes a partir de la otra
     base = pd.Timestamp("2025-09-01")
-    if "Julian_days" not in dfh.columns or dfh["Julian_days"].isna().all():
-        if "Fecha" in dfh.columns:
-            dfh["Julian_days"] = (dfh["Fecha"] - base).dt.days + 1
+    tiene_fecha = "Fecha" in dfh.columns and not dfh["Fecha"].isna().all()
+    tiene_jd    = "Julian_days" in dfh.columns and not dfh["Julian_days"].isna().all()
 
-    # Ordenar + deduplicar por fecha (sin crear nuevas fechas)
+    if not tiene_fecha and tiene_jd:
+        # Crear Fecha desde Julian_days
+        jd = pd.to_numeric(dfh["Julian_days"], errors="coerce")
+        dfh["Fecha"] = (base + pd.to_timedelta(jd - 1, unit="D")).dt.normalize()
+        tiene_fecha = True
+
+    if not tiene_jd and tiene_fecha:
+        # Crear Julian_days desde Fecha
+        dfh["Julian_days"] = (dfh["Fecha"] - base).dt.days + 1
+        tiene_jd = True
+
+    # Si no hay ninguna de las dos, avisar y salir
+    if not tiene_fecha and not tiene_jd:
+        st.error(
+            f"{HISTORY_PATH.name} debe incluir al menos 'Fecha' (o 'date') "
+            f"o 'Julian_days' (alias: julian, jday). Columnas encontradas: {list(dfh.columns)}"
+        )
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
+    # Ordenar + deduplicar por fecha si existe; si no, por Julian_days
+    if tiene_fecha:
+        dfh = dfh.dropna(subset=["Fecha"])
+        dfh = dfh.drop_duplicates("Fecha").sort_values("Fecha")
+    else:
+        dfh = dfh.dropna(subset=["Julian_days"])
+        dfh = dfh.drop_duplicates("Julian_days").sort_values("Julian_days")
+
+    # Columnas finales disponibles
     keep_cols = [c for c in ["Fecha","Julian_days","TMAX","TMIN","Prec"] if c in dfh.columns]
-    dfh = (dfh[keep_cols]
-           .dropna(subset=["Fecha"])
-           .drop_duplicates("Fecha")
-           .sort_values("Fecha")
-           .reset_index(drop=True))
+    dfh = dfh[keep_cols].reset_index(drop=True)
 
     return dfh
 
@@ -177,6 +219,18 @@ with st.sidebar:
         except Exception:
             pass
         st.rerun()
+
+# (Opcional) visor rápido del CSV
+with st.expander("🔎 Previsualizar meteo_history.csv (opcional)"):
+    if HISTORY_PATH.exists():
+        try:
+            _raw = pd.read_csv(HISTORY_PATH)
+            st.write("Columnas detectadas:", list(_raw.columns))
+            st.dataframe(_raw.head(10))
+        except Exception as e:
+            st.warning(f"No se pudo previsualizar: {e}")
+    else:
+        st.info("No se encontró meteo_history.csv")
 
 def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
     req = {"Julian_days","TMAX","TMIN","Prec"}
@@ -299,5 +353,12 @@ df_hist = load_history_strict()
 if df_hist.empty:
     st.stop()
 else:
-    st.success(f"History: {df_hist['Fecha'].min().date()} → {df_hist['Fecha'].max().date()} · {len(df_hist)} día(s)")
+    # Mensaje de cobertura temporal del CSV
+    if "Fecha" in df_hist.columns and not df_hist["Fecha"].isna().all():
+        st.success(f"History: {df_hist['Fecha'].min().date()} → {df_hist['Fecha'].max().date()} · {len(df_hist)} día(s)")
+    elif "Julian_days" in df_hist.columns and not df_hist["Julian_days"].isna().all():
+        st.success(f"History (por Julian_days): {int(df_hist['Julian_days'].min())} → {int(df_hist['Julian_days'].max())} · {len(df_hist)} día(s)")
+    else:
+        st.success(f"History cargado: {len(df_hist)} fila(s)")
+
     procesar_y_mostrar(df_hist, "meteo_history.csv")
