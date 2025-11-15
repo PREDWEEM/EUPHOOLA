@@ -131,8 +131,8 @@ pred["EMERREL_MA5"] = pred["EMERREL"].rolling(5, min_periods=1).mean()
 
 
 # ------------------ CLASIFICACIÓN (sobre MA5) ------------------
-THR_BAJO_MEDIO = 0.02
-THR_MEDIO_ALTO = 0.07
+THR_BAJO_MEDIO = 0.05
+THR_MEDIO_ALTO = 0.20
 
 def nivel(v):
     return "Bajo" if v < THR_BAJO_MEDIO else ("Medio" if v <= THR_MEDIO_ALTO else "Alto")
